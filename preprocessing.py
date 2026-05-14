@@ -1,435 +1,219 @@
-# ============================================================
-# Lateral Movement Detection System
-# Step 3: Data Preprocessing
-#
-# Purpose: Convert all features into numbers that the
-# Isolation Forest ML model can understand and process.
-# We apply two techniques from the paper:
-# 1. One Hot Encoding (OHE) for text columns
-# 2. MinMax Scaling for number columns
-#
-# Reference: Smiliotopoulos et al. (2025)
-# "Assessing the detection of lateral movement through
-#  unsupervised learning techniques"
-# Computers & Security, Volume 149
-# Section 2.4: Data Preprocessing
-# ============================================================
+"""
+preprocessing.py -- Feature selection, OHE, MinMax scaling, and multi-scale slicing.
 
+Pipeline (exactly as Smiliotopoulos 2025, Section 3):
+  1. Select 8 core features + label column
+  2. One-Hot Encode categorical features
+  3. MinMax Scale numeric features  (fit on full dataset -> transform all slices)
+  4. Re-attach the label column (never scaled)
+  5. Save 4 pre-sliced CSV files: 100k / 500k / 1M / full
+     (large slices written in chunks to stay within RAM limits)
+"""
 
-# ============================================================
-# Import Required Libraries
-#
-# pandas      → for loading and working with data tables
-# numpy       → for working with numbers and arrays
-# OneHotEncoder → converts text columns to 0/1 columns
-# MinMaxScaler  → scales number columns to 0-1 range
-# ColumnTransformer → applies different preprocessing
-#                     to different columns at the same time
-# ============================================================
-
+import os
+import gc
 import pandas as pd
 import numpy as np
-from sklearn.preprocessing import OneHotEncoder
 from sklearn.preprocessing import MinMaxScaler
-from sklearn.compose import ColumnTransformer
+from colorama import Fore, Style, init as colorama_init
 
-
-# ============================================================
-# Step 1: Load the Dataset After Feature Selection
-# This file was saved in the previous step
-# It contains 50,000 rows and 9 columns:
-# 8 features + Label column
-# ============================================================
-
-print("================================================")
-print("         LOADING FEATURE SELECTED DATASET      ")
-print("================================================")
-
-# Load the dataset we saved in feature_selection.py
-dataset_after_feature_selection = pd.read_csv(
-    'dataset_after_feature_selection.csv'
+from src.config import (
+    CORE_FEATURES,
+    CATEGORICAL_FEATURES,
+    NUMERIC_FEATURES,
+    LABEL_COLUMN,
+    OUTPUT_DIR,
+    SAMPLE_SIZES,
+    RANDOM_STATE,
 )
 
-print("Dataset loaded successfully!")
-print(f"Total rows    : {len(dataset_after_feature_selection)}")
-print(f"Total columns : {dataset_after_feature_selection.shape[1]}")
+colorama_init(autoreset=True)
+
+# Rows written per chunk to disk (keeps peak RAM low during CSV export)
+WRITE_CHUNK_SIZE = 50_000
 
 
-# ============================================================
-# Step 2: Show the Data BEFORE Preprocessing
-# So we can compare what it looks like before and after
-# ============================================================
+# ----------------------------------------------------------------
+#  Internal helpers
+# ----------------------------------------------------------------
 
-print("\n================================================")
-print("          DATA BEFORE PREPROCESSING            ")
-print("================================================")
-print(dataset_after_feature_selection.head(3).to_string())
+def _ok(msg: str)   -> None: print(Fore.GREEN  + "  [OK]   " + Style.RESET_ALL + msg)
+def _info(msg: str) -> None: print(Fore.CYAN   + "  [-->]  " + Style.RESET_ALL + msg)
+def _warn(msg: str) -> None: print(Fore.YELLOW + "  [WARN] " + Style.RESET_ALL + msg)
 
 
-# ============================================================
-# Step 3: Separate Features from Label
-#
-# We separate the dataset into two parts:
-# 1. features_dataset → the 8 columns we will preprocess
-# 2. label_column     → the Label column we keep separate
-#
-# Why separate?
-# The Label column must NOT be preprocessed
-# It is only used AFTER training to evaluate the model
-# The paper used unlabeled data for training
-# (unsupervised learning does not need labels)
-# ============================================================
+def _select_features(df: pd.DataFrame):
+    """
+    Keep only the 8 core features and the label column.
+    Returns (features_df, label_series).
+    """
+    available = [c for c in CORE_FEATURES if c in df.columns]
+    missing   = [c for c in CORE_FEATURES if c not in df.columns]
 
-print("\n================================================")
-print("      SEPARATING FEATURES FROM LABEL           ")
-print("================================================")
+    if missing:
+        _warn(f"Skipping {len(missing)} missing core feature(s): {missing}")
+    else:
+        _ok(f"All 8 core feature columns selected.")
 
-# The 8 feature columns only (no Label)
-features_dataset = dataset_after_feature_selection.drop(
-    columns=['Label']
-)
+    features = df[available].copy()
+    label    = df[LABEL_COLUMN].copy() if LABEL_COLUMN in df.columns else None
 
-# The Label column only (0 = Normal, 1 = Attack)
-label_column = dataset_after_feature_selection['Label']
+    if label is None:
+        _warn(f"Label column '{LABEL_COLUMN}' not found -- output will have no label column.")
 
-print(f"Features dataset shape : {features_dataset.shape}")
-print(f"Label column shape     : {label_column.shape}")
-print(f"Feature columns        : {features_dataset.columns.tolist()}")
+    return features, label
 
 
-# ============================================================
-# Step 4: Define Which Columns Get Which Preprocessing
-#
-# From Table 3 of the paper:
-# Categorical (text) columns → apply OHE
-# Numerical (number) columns → apply MinMax
-# ============================================================
+def _apply_ohe(df: pd.DataFrame) -> pd.DataFrame:
+    """
+    One-Hot Encode all categorical feature columns.
+    Uses pandas get_dummies (drop_first=False) -- matches paper methodology.
+    """
+    cat_cols = [c for c in CATEGORICAL_FEATURES if c in df.columns]
+    _info(f"Applying OHE to {len(cat_cols)} categorical column(s): {cat_cols}")
 
-print("\n================================================")
-print("      DEFINING PREPROCESSING COLUMN TYPES      ")
-print("================================================")
-
-# These 5 columns contain TEXT values
-# They will be converted to 0/1 columns using OHE
-categorical_columns_for_ohe = [
-    'Computer',            # Machine names (text)
-    'DestinationPortName', # Port names like SMB, RDP (text)
-    'EventID',             # Event type numbers stored as text
-    'Initiated',           # true or false (text)
-    'SourceIsIpv6'         # true or false (text)
-]
-
-# These 3 columns contain NUMBER values
-# They will be scaled to 0-1 range using MinMax
-numerical_columns_for_minmax = [
-    'EventRecordID',       # Large sequential numbers
-    'Execution_ProcessID', # Large process ID numbers
-    'ProcessID'            # Large process ID numbers
-]
-
-print("Columns that will receive OHE (text columns):")
-for column_name in categorical_columns_for_ohe:
-    print(f"  → {column_name}")
-
-print("\nColumns that will receive MinMax (number columns):")
-for column_name in numerical_columns_for_minmax:
-    print(f"  → {column_name}")
+    df_encoded = pd.get_dummies(df, columns=cat_cols, drop_first=False, dtype=np.float32)
+    n_new = df_encoded.shape[1] - df.shape[1] + len(cat_cols)
+    _ok(f"OHE complete. Features expanded: {df.shape[1]} -> {df_encoded.shape[1]}  (+{n_new} dummy cols)")
+    return df_encoded
 
 
-# ============================================================
-# Step 5: Create the Preprocessing Pipeline
-#
-# ColumnTransformer applies different transformations
-# to different columns at the same time:
-# - OHE is applied to the 5 text columns
-# - MinMax is applied to the 3 number columns
-#
-# OneHotEncoder settings:
-# handle_unknown='ignore' → if a new unknown value appears
-#                           during testing, ignore it
-#                           instead of causing an error
-# sparse_output=False     → return a regular array
-#                           not a compressed sparse matrix
-#
-# MinMaxScaler:
-# Default range is 0 to 1
-# All numbers will be scaled between 0 and 1
-# ============================================================
+def _apply_minmax(df: pd.DataFrame, scaler=None):
+    """
+    MinMax scale numeric feature columns to [0, 1].
+    If scaler is None, a new scaler is fit on df (used for the full dataset).
+    """
+    num_cols = [c for c in NUMERIC_FEATURES if c in df.columns]
+    _info(f"Applying MinMax scaling to {len(num_cols)} numeric column(s): {num_cols}")
 
-print("\n================================================")
-print("      CREATING PREPROCESSING PIPELINE          ")
-print("================================================")
+    if scaler is None:
+        scaler = MinMaxScaler(feature_range=(0, 1))
+        df[num_cols] = scaler.fit_transform(df[num_cols])
+        _ok("MinMax scaler fit+transform on full dataset.")
+    else:
+        df[num_cols] = scaler.transform(df[num_cols])
+        _ok("MinMax transform applied using pre-fit scaler.")
 
-# Create the preprocessing pipeline
-# This combines OHE and MinMax into one step
-preprocessing_pipeline = ColumnTransformer(
-    transformers=[
-        (
-            'one_hot_encoding',        # Name of this transformation
-            OneHotEncoder(             # The transformation to apply
-                handle_unknown='ignore',
-                sparse_output=False
-            ),
-            categorical_columns_for_ohe  # Apply to these columns
-        ),
-        (
-            'minmax_scaling',          # Name of this transformation
-            MinMaxScaler(),            # The transformation to apply
-            numerical_columns_for_minmax # Apply to these columns
+    return df, scaler
+
+
+def _save_chunked(df: pd.DataFrame, out_path: str) -> None:
+    """
+    Write df to CSV in WRITE_CHUNK_SIZE-row chunks.
+    Avoids holding the entire string-converted frame in RAM at once,
+    which prevents ArrayMemoryError on 1M+ row datasets.
+    """
+    total = len(df)
+    for i, start in enumerate(range(0, total, WRITE_CHUNK_SIZE)):
+        chunk = df.iloc[start : start + WRITE_CHUNK_SIZE]
+        chunk.to_csv(
+            out_path,
+            mode="a" if i > 0 else "w",
+            index=False,
+            header=(i == 0),
         )
-    ]
-)
-
-print("Preprocessing pipeline created successfully!")
-print("Pipeline contains:")
-print("  → One Hot Encoder  for 5 text columns")
-print("  → MinMax Scaler    for 3 number columns")
+        pct = min((start + WRITE_CHUNK_SIZE) / total * 100, 100)
+        print(f"    writing... {pct:5.1f}%", end="\r")
+    print()  # newline after \r
 
 
-# ============================================================
-# Step 6: Apply Preprocessing to the Features Dataset
-#
-# fit_transform does two things:
-# 1. fit   → learns the data
-#            (finds all unique values for OHE,
-#             finds min and max for MinMax)
-# 2. transform → applies the transformation
-#            (converts text to 0/1,
-#             scales numbers to 0-1)
-#
-# The result is a numpy array of numbers
-# All values will be between 0 and 1
-# ============================================================
+def _save_slice(df: pd.DataFrame, name: str) -> str:
+    """Save a dataframe slice to outputs/ using chunked writing."""
+    os.makedirs(OUTPUT_DIR, exist_ok=True)
+    out_path = os.path.join(OUTPUT_DIR, f"preprocessed_data_{name}.csv")
 
-print("\n================================================")
-print("         APPLYING PREPROCESSING                ")
-print("================================================")
-print("Please wait...")
+    _info(f"Writing [{name}] slice ({len(df):,} rows, {df.shape[1]} cols)...")
+    _save_chunked(df, out_path)
 
-# Apply OHE and MinMax to all 8 feature columns
-preprocessed_features_array = preprocessing_pipeline.fit_transform(
-    features_dataset
-)
-
-print("Preprocessing applied successfully!")
-print(f"Shape after preprocessing : {preprocessed_features_array.shape}")
-print(f"Expected shape            : (50000, 47)")
+    size_mb = os.path.getsize(out_path) / (1024 ** 2)
+    _ok(f"Saved [{name:>5s}] -> {out_path}  ({size_mb:.1f} MB,  {len(df):,} rows)")
+    return out_path
 
 
-# ============================================================
-# Step 7: Get the New Column Names After OHE
-#
-# After OHE the text columns expand into many columns
-# We need to get the names of all new columns
-# so we can create a proper table with headers
-# ============================================================
+# ----------------------------------------------------------------
+#  Public API
+# ----------------------------------------------------------------
 
-print("\n================================================")
-print("         GETTING NEW COLUMN NAMES              ")
-print("================================================")
+def run_pipeline(df: pd.DataFrame) -> dict:
+    """
+    Full preprocessing pipeline.
 
-# Get names of all new OHE columns
-# The encoder creates names like:
-# "one_hot_encoding__Computer_LAPTOP-ABC"
-# "one_hot_encoding__EventID_1"
-ohe_column_names = (
-    preprocessing_pipeline
-    .named_transformers_['one_hot_encoding']
-    .get_feature_names_out(categorical_columns_for_ohe)
-    .tolist()
-)
+    Parameters
+    ----------
+    df : pd.DataFrame
+        Raw dataset as returned by data_loader.load_and_verify().
 
-# The MinMax columns keep their original names
-minmax_column_names = numerical_columns_for_minmax
+    Returns
+    -------
+    dict[str, str]
+        Mapping of scale name -> saved CSV path.
+    """
+    print(Fore.CYAN + "\n" + "="*60)
+    print("  STEP 2 -- Preprocessing Pipeline")
+    print("="*60 + Style.RESET_ALL)
 
-# Combine OHE names + MinMax names
-all_new_column_names = ohe_column_names + minmax_column_names
+    # -- 1. Feature selection ---------------------------------
+    print(f"\n  [1/4] Feature Selection")
+    features_df, label_series = _select_features(df)
 
-print(f"Number of OHE columns    : {len(ohe_column_names)}")
-print(f"Number of MinMax columns : {len(minmax_column_names)}")
-print(f"Total columns            : {len(all_new_column_names)}")
+    # Free the raw df to recover RAM before OHE expansion
+    del df
+    gc.collect()
 
+    # -- 2. One-Hot Encoding ----------------------------------
+    print(f"\n  [2/4] One-Hot Encoding")
+    features_encoded = _apply_ohe(features_df)
+    del features_df
+    gc.collect()
 
-# ============================================================
-# Step 8: Convert the Preprocessed Array to a Table
-#
-# After preprocessing we have a numpy array (just numbers)
-# We convert it back to a pandas DataFrame (table with headers)
-# This makes it easier to work with and save
-# ============================================================
+    # -- 3. MinMax Scaling (fit on full data) -----------------
+    print(f"\n  [3/4] MinMax Scaling")
+    features_scaled, fitted_scaler = _apply_minmax(features_encoded)
+    del features_encoded
+    gc.collect()
 
-print("\n================================================")
-print("      CONVERTING ARRAY TO TABLE                ")
-print("================================================")
+    # -- 4. Re-attach label -----------------------------------
+    if label_series is not None:
+        features_scaled[LABEL_COLUMN] = label_series.values
+        _ok(f"Label column '{LABEL_COLUMN}' re-attached (not scaled).")
 
-# Convert numpy array to pandas DataFrame with column names
-preprocessed_features_dataset = pd.DataFrame(
-    preprocessed_features_array,
-    columns=all_new_column_names
-)
+    total_features = features_scaled.shape[1] - (1 if label_series is not None else 0)
+    _ok(f"Final feature count after OHE: {total_features}")
 
-print("Conversion successful!")
-print(f"Shape : {preprocessed_features_dataset.shape}")
+    # -- 5. Slice & Save (chunked writes) ---------------------
+    print(f"\n  [4/4] Saving Multi-Scale Slices")
+    saved_paths = {}
 
+    for name, n in SAMPLE_SIZES.items():
+        if n is None:
+            slice_df = features_scaled  # no copy -- full dataset
+        else:
+            # Stratified random sample to preserve class ratio
+            if label_series is not None and features_scaled[LABEL_COLUMN].nunique() > 1:
+                slice_df = (
+                    features_scaled
+                    .groupby(LABEL_COLUMN, group_keys=False)
+                    .apply(lambda g: g.sample(
+                        min(n, len(g)),
+                        random_state=RANDOM_STATE
+                    ))
+                    .sample(frac=1, random_state=RANDOM_STATE)
+                    .reset_index(drop=True)
+                    .iloc[:n]
+                )
+            else:
+                slice_df = features_scaled.sample(
+                    n=min(n, len(features_scaled)),
+                    random_state=RANDOM_STATE
+                ).reset_index(drop=True)
 
-# ============================================================
-# Step 9: Add the Label Column Back
-#
-# We kept the Label column separate during preprocessing
-# Now we add it back to the preprocessed dataset
-# It will be used later for evaluation only
-# NOT for training the Isolation Forest model
-# ============================================================
+        path = _save_slice(slice_df, name)
+        saved_paths[name] = path
 
-print("\n================================================")
-print("         ADDING LABEL COLUMN BACK              ")
-print("================================================")
+        # Free small slices immediately; keep full for last
+        if n is not None:
+            del slice_df
+            gc.collect()
 
-# Add Label column to the right side of the table
-preprocessed_features_dataset['Label'] = label_column.values
-
-# Calculate the actual column counts from the real data
-# We do not hardcode these numbers
-# We read them directly from the dataset shape
-actual_number_of_total_columns   = preprocessed_features_dataset.shape[1]
-actual_number_of_feature_columns = actual_number_of_total_columns - 1
-
-print("Label column added back successfully!")
-print(f"Final dataset shape      : {preprocessed_features_dataset.shape}")
-print(f"Total columns            : {actual_number_of_total_columns}")
-print(f"  → {actual_number_of_feature_columns} preprocessed feature columns")
-print(f"  → 1 Label column")
-print(f"  → {actual_number_of_total_columns} columns total")
-
-
-# ============================================================
-# Step 10: Verify the Preprocessing Results
-#
-# We check that:
-# 1. All values are between 0 and 1
-# 2. No missing values were created
-# 3. Label distribution is still correct
-# ============================================================
-
-print("\n================================================")
-print("         VERIFYING PREPROCESSING RESULTS       ")
-print("================================================")
-
-# Check minimum and maximum values in feature columns
-# (exclude Label column from this check)
-feature_columns_only = preprocessed_features_dataset.drop(
-    columns=['Label']
-)
-
-minimum_value = feature_columns_only.min().min()
-maximum_value = feature_columns_only.max().max()
-
-print(f"Minimum value in features : {round(minimum_value, 4)}")
-print(f"Maximum value in features : {round(maximum_value, 4)}")
-
-if minimum_value >= 0 and maximum_value <= 1:
-    print("All values are between 0 and 1 ✓")
-else:
-    print("WARNING: Some values are outside 0-1 range!")
-
-# Check for missing values
-total_missing_values = preprocessed_features_dataset.isnull().sum().sum()
-
-if total_missing_values == 0:
-    print("No missing values found ✓")
-else:
-    print(f"WARNING: {total_missing_values} missing values found!")
-
-# Check label distribution
-label_counts = preprocessed_features_dataset['Label'].value_counts()
-normal_count = label_counts[0]
-attack_count = label_counts[1]
-total_count  = len(preprocessed_features_dataset)
-
-normal_percentage = round(normal_count / total_count * 100, 2)
-attack_percentage = round(attack_count / total_count * 100, 2)
-
-print(f"\nLabel Distribution:")
-print(f"Normal rows (Label = 0) : {normal_count} ({normal_percentage}%)")
-print(f"Attack rows (Label = 1) : {attack_count} ({attack_percentage}%)")
-print(f"Total rows              : {total_count}")
-
-
-# ============================================================
-# Step 11: Show Sample of Preprocessed Data
-# So we can visually confirm values are between 0 and 1
-# ============================================================
-
-print("\n================================================")
-print("      SAMPLE OF PREPROCESSED DATA (3 rows)     ")
-print("   Showing first 5 columns + Label column      ")
-print("================================================")
-
-# Show first 3 rows and first 5 columns + Label
-first_five_columns = preprocessed_features_dataset.iloc[
-    :3,
-    :5
-]
-print(first_five_columns.to_string())
-print("\n(All other columns also contain values between 0 and 1)")
-
-
-# ============================================================
-# Step 12: Save the Preprocessed Dataset
-#
-# We save two versions:
-# 1. With Label    → for evaluation after training
-# 2. Without Label → for training Isolation Forest
-#                    (unsupervised = no labels needed)
-# ============================================================
-
-print("\n================================================")
-print("         SAVING PREPROCESSED DATASETS          ")
-print("================================================")
-
-# Save version WITH Label (for evaluation)
-output_file_with_label = 'preprocessed_dataset_with_label.csv'
-
-preprocessed_features_dataset.to_csv(
-    output_file_with_label,
-    index=False
-)
-
-print(f"Saved WITH label    : {output_file_with_label}")
-print(f"Rows                : {len(preprocessed_features_dataset)}")
-print(f"Columns             : {preprocessed_features_dataset.shape[1]}")
-
-# Save version WITHOUT Label (for training)
-# This is what we feed to Isolation Forest
-output_file_without_label = 'preprocessed_dataset_without_label.csv'
-
-preprocessed_dataset_without_label = preprocessed_features_dataset.drop(
-    columns=['Label']
-)
-
-preprocessed_dataset_without_label.to_csv(
-    output_file_without_label,
-    index=False
-)
-
-print(f"\nSaved WITHOUT label : {output_file_without_label}")
-print(f"Rows                : {len(preprocessed_dataset_without_label)}")
-print(f"Columns             : {preprocessed_dataset_without_label.shape[1]}")
-
-
-# ============================================================
-# Preprocessing Complete
-# ============================================================
-
-print("\n================================================")
-print("           PREPROCESSING COMPLETE              ")
-print("================================================")
-print("Two files saved:")
-print(f"  1. {output_file_with_label}")
-print(f"     → 90 columns (89 features + Label)")
-print(f"     → Used for evaluation after training")
-print(f"  2. {output_file_without_label}")
-print(f"     → 89 columns (features only, no Label)")
-print(f"     → Used for training Isolation Forest")
-print("\nNext step: Train Isolation Forest ML Model")
-print("================================================")
+    print(Fore.GREEN + "\n  Preprocessing pipeline complete.\n" + Style.RESET_ALL)
+    return saved_paths

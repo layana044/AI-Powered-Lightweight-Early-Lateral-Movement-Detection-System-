@@ -1,140 +1,85 @@
-# ============================================================
-# Lateral Movement Detection System
-# Configuration File: config.py
-#
-# Purpose:
-# Central configuration for the rule-based correlation engine.
-# All thresholds, port names, event IDs, file paths, severity
-# levels, and MITRE references are defined here.
-#
-# Notes:
-# - EventRecordID is used as a proxy for time because the
-#   dataset after feature selection does not contain a
-#   timestamp column.
-# - Thresholds are triggered when event count is GREATER THAN
-#   the configured threshold inside the configured window.
-# ============================================================
+"""
+config.py — Central configuration for LM_System.
+All paths, constants, and experiment parameters live here.
+To switch between dev-mode and full-scale, edit SAMPLE_SIZES or
+set DEV_MODE = True to run only the 100k slice quickly.
+"""
 
+import os
 
-# ============================================================
-# Dataset / Output Files
-# ============================================================
+# ─────────────────────────────────────────────
+#  Paths
+# ─────────────────────────────────────────────
 
-DATASET_FILE_PATH = 'dataset_after_feature_selection.csv'
-ALERTS_OUTPUT_FILE = 'rule_engine_alerts.csv'
+# Absolute path to the raw LMD-2023 CSV (1.75 M records, 93 features)
+RAW_DATA_PATH = r"C:\Users\USER\Desktop\LM_Project\LMD-2023 [1.75M Elements][Labelled]checked.csv"
 
+# Project root (auto-resolved so the script works from any cwd)
+PROJECT_ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+OUTPUT_DIR   = os.path.join(PROJECT_ROOT, "outputs")
 
-# ============================================================
-# Required Columns
-# ============================================================
+# ─────────────────────────────────────────────
+#  Dataset expectations (for integrity checks)
+# ─────────────────────────────────────────────
 
-REQUIRED_COLUMNS = [
-    'Computer',
-    'EventID',
-    'DestinationPortName',
-    'EventRecordID',
-    'Initiated',
-    'ProcessID',
-    'Label'
+EXPECTED_MIN_ROWS = 1_700_000   # allow slight tolerance around 1.75 M
+EXPECTED_COLS     = 93          # raw feature count per the paper
+
+# ─────────────────────────────────────────────
+#  8 Core Features — Table 3, Smiliotopoulos 2025
+#  Format:  paper_name  →  actual CSV column name
+#  (data_loader prints the real header so you can fix any mismatch)
+# ─────────────────────────────────────────────
+
+FEATURE_MAP = {
+    "CompSTA"     : "Computer",
+    "DstPortName" : "DestinationPortName",
+    "EventID"     : "EventID",
+    "EventRecID"  : "EventRecordID",
+    "ExecProcID"  : "Execution_ProcessID",
+    "Init"        : "Initiated",
+    "ProcessId"   : "ProcessId",
+    "SrcIpv6"     : "SourceIsIpv6",
+}
+
+# Convenience list of CSV column names to keep
+CORE_FEATURES = list(FEATURE_MAP.values())
+
+# Label column name in the raw CSV
+LABEL_COLUMN = "Label"
+
+# ─────────────────────────────────────────────
+#  Categorical vs Numeric split (for OHE / MinMax)
+# ─────────────────────────────────────────────
+
+CATEGORICAL_FEATURES = [
+    "Computer",
+    "DestinationPortName",
+    "Initiated",
+    "SourceIp",
 ]
 
+NUMERIC_FEATURES = [
+    "EventID",
+    "EventRecordID",
+    "Execution_ProcessID",
+    "ProcessId",
+]
 
-# ============================================================
-# Sysmon Event IDs
-# ============================================================
+# ─────────────────────────────────────────────
+#  Incremental data scales
+#  None → load all rows (full 1.75 M — paper-comparable)
+# ─────────────────────────────────────────────
 
-EVENTID_PROCESS_CREATION = 1
-EVENTID_NETWORK_CONNECTION = 3
-EVENTID_PROCESS_ACCESS = 10
-EVENTID_DNS_QUERY = 22
+SAMPLE_SIZES = {
+    "100k" : 100_000,
+    "500k" : 500_000,
+    "1M"   : 1_000_000,
+    "full" : None,
+}
 
+# ─────────────────────────────────────────────
+#  Reproducibility
+# ─────────────────────────────────────────────
 
-# ============================================================
-# DestinationPortName Values
-# ============================================================
-
-PORT_SMB = 'microsoft-ds'      # Port 445
-PORT_RDP = 'ms-wbt-server'     # Port 3389
-PORT_LDAP = 'ldap'             # Port 389
-PORT_DNS = 'domain'            # Port 53
-
-
-# ============================================================
-# Record-Based Time Windows
-# ============================================================
-
-TIME_WINDOW_VERY_RAPID_RECORDS = 30
-TIME_WINDOW_RAPID_RECORDS = 60
-TIME_WINDOW_MODERATE_RECORDS = 120
-TIME_WINDOW_SLOW_RECORDS = 300
-
-
-# ============================================================
-# Rule Thresholds / Windows
-# Trigger condition = count > threshold
-# ============================================================
-
-# Rule 1: SMB rapid scan / rapid SMB exploitation behavior
-RULE_1_SMB_RAPID_SCAN_THRESHOLD = 3
-RULE_1_SMB_RAPID_SCAN_TIME_WINDOW = TIME_WINDOW_RAPID_RECORDS
-
-# Rule 2: RDP rapid exploitation pattern
-RULE_2_RDP_RAPID_EXPLOIT_THRESHOLD = 3
-RULE_2_RDP_RAPID_EXPLOIT_TIME_WINDOW = TIME_WINDOW_MODERATE_RECORDS
-
-# Rule 3: LDAP flood pattern
-RULE_3_LDAP_FLOOD_THRESHOLD = 10
-RULE_3_LDAP_FLOOD_TIME_WINDOW = TIME_WINDOW_VERY_RAPID_RECORDS
-
-# Rule 4: Suspicious process access activity
-RULE_4_PROCESS_ACCESS_THRESHOLD = 2
-
-# Rule 5: Process creation followed by SMB activity
-RULE_5_PROCESS_TO_SMB_TIME_WINDOW = TIME_WINDOW_MODERATE_RECORDS
-
-# Rule 6: LDAP reconnaissance
-RULE_6_LDAP_RECON_THRESHOLD = 5
-RULE_6_LDAP_RECON_TIME_WINDOW = TIME_WINDOW_RAPID_RECORDS
-
-# Rule 7: RDP credential-based movement
-RULE_7_RDP_CREDENTIAL_MOVEMENT_THRESHOLD = 3
-RULE_7_RDP_CREDENTIAL_MOVEMENT_TIME_WINDOW = TIME_WINDOW_SLOW_RECORDS
-
-# Rule 8: Full lateral movement kill chain
-RULE_8_KILL_CHAIN_TIME_WINDOW = TIME_WINDOW_SLOW_RECORDS
-
-# Rule 9: DNS reconnaissance
-RULE_9_DNS_RECON_THRESHOLD = 10
-RULE_9_DNS_RECON_TIME_WINDOW = TIME_WINDOW_RAPID_RECORDS
-
-
-# ============================================================
-# Alert Severity Levels
-# ============================================================
-
-SEVERITY_CRITICAL = 'CRITICAL'
-SEVERITY_HIGH = 'HIGH'
-SEVERITY_MEDIUM = 'MEDIUM'
-SEVERITY_LOW = 'LOW'
-
-
-# ============================================================
-# Alert Status Values
-# ============================================================
-
-STATUS_UNRESOLVED = 'Unresolved'
-STATUS_IN_PROGRESS = 'In Progress'
-STATUS_RESOLVED = 'Resolved'
-
-
-# ============================================================
-# MITRE ATT&CK References
-# ============================================================
-
-MITRE_EXPLOITATION_REMOTE_SERVICES = 'T1210 - Exploitation of Remote Services'
-MITRE_OS_CREDENTIAL_DUMPING = 'T1003 - OS Credential Dumping'
-MITRE_COMMAND_AND_SCRIPTING = 'T1059 - Command and Scripting Interpreter'
-MITRE_SMB_LATERAL_MOVEMENT = 'T1021.002 - Remote Services: SMB/Windows Admin Shares'
-MITRE_RDP_LATERAL_MOVEMENT = 'T1021.001 - Remote Services: Remote Desktop Protocol'
-MITRE_REMOTE_SYSTEM_DISCOVERY = 'T1018 - Remote System Discovery'
-MITRE_LATERAL_MOVEMENT_TACTIC = 'TA0008 - Lateral Movement'
+RANDOM_STATE = 42
